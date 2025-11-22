@@ -1,10 +1,15 @@
 # ============================================================
-# 🧠 SAINT-style Tabular Transformer (Improved)
-# Train / Val / Test + Early Stopping + Warmup Cosine Scheduler
-# Dataset: Bone Tumor Dataset.csv
+# 🦴 Bone Tumor Outcome Prediction (MSKCC)
+# Stacked Ensemble:
+#   - XGBoost
+#   - LightGBM
+#   - CatBoost
+#   - SAINT-B Tabular Transformer (bigger)
+# Meta-learner: XGBoost on validation probabilities
+# Includes threshold tuning for high recall on "Dead"
 # ============================================================
 
-!pip install -q torch torchvision torchaudio
+!pip install -q xgboost lightgbm catboost torch torchvision torchaudio
 
 from google.colab import files
 import pandas as pd
@@ -23,6 +28,10 @@ from sklearn.metrics import (
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 
 # ------------------------------------------------------------
 # 1) Upload & load dataset
@@ -101,6 +110,12 @@ X_train_t = X_train_t.reset_index(drop=True)
 X_val_t = X_val_t.reset_index(drop=True)
 X_test_t = X_test_t.reset_index(drop=True)
 
+# Full feature arrays for tree models (cat+num)
+X_train_arr = X_train_t.values.astype(np.float32)
+X_val_arr = X_val_t.values.astype(np.float32)
+X_test_arr = X_test_t.values.astype(np.float32)
+
+# Separate for SAINT
 cat_train = X_train_t[categorical_cols].values.astype(np.int64) if categorical_cols else None
 cat_val = X_val_t[categorical_cols].values.astype(np.int64) if categorical_cols else None
 cat_test = X_test_t[categorical_cols].values.astype(np.int64) if categorical_cols else None
@@ -110,7 +125,57 @@ num_val = X_val_t[numeric_cols].values.astype(np.float32) if numeric_cols else N
 num_test = X_test_t[numeric_cols].values.astype(np.float32) if numeric_cols else None
 
 # ------------------------------------------------------------
-# 5) Dataset & DataLoaders
+# 5) Tree-based base models: XGBoost, LightGBM, CatBoost
+# ------------------------------------------------------------
+# class imbalance ratio based on TRAIN
+n_pos = (y_train == 1).sum()
+n_neg = (y_train == 0).sum()
+scale_pos_weight = n_neg / max(n_pos, 1)
+print(f"\nscale_pos_weight for tree models: {scale_pos_weight:.3f}")
+
+# XGBoost
+xgb_model = XGBClassifier(
+    n_estimators=400,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    scale_pos_weight=scale_pos_weight,
+    random_state=42,
+    n_jobs=-1,
+)
+xgb_model.fit(X_train_arr, y_train)
+
+# LightGBM
+lgbm_model = LGBMClassifier(
+    n_estimators=500,
+    learning_rate=0.05,
+    num_leaves=31,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    class_weight={0: 1.0, 1: float(scale_pos_weight)},
+    random_state=42,
+    n_jobs=-1,
+)
+lgbm_model.fit(X_train_arr, y_train)
+
+# CatBoost
+cat_model = CatBoostClassifier(
+    iterations=500,
+    learning_rate=0.05,
+    depth=6,
+    loss_function="Logloss",
+    eval_metric="AUC",
+    verbose=False,
+    random_seed=42,
+    class_weights=[1.0, float(scale_pos_weight)],
+)
+cat_model.fit(X_train_arr, y_train)
+
+# ------------------------------------------------------------
+# 6) SAINT-B: Bigger tabular transformer
 # ------------------------------------------------------------
 class TabularDataset(Dataset):
     def __init__(self, cat_data, num_data, y):
@@ -135,12 +200,9 @@ train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
 test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
 
-# ------------------------------------------------------------
-# 6) SAINT-style Transformer model
-# ------------------------------------------------------------
 class SAINTTabular(nn.Module):
     def __init__(self, cat_cardinalities, num_features,
-                 d_model=64, n_heads=4, n_layers=2, dropout=0.3):
+                 d_model=128, n_heads=4, n_layers=4, dropout=0.2):
         super().__init__()
         self.has_cat = len(cat_cardinalities) > 0
         self.has_num = num_features > 0
@@ -206,32 +268,21 @@ if categorical_cols:
 
 num_features = len(numeric_cols)
 
-model = SAINTTabular(
+saint_model = SAINTTabular(
     cat_cardinalities=cat_cardinalities,
     num_features=num_features,
-    d_model=64,
+    d_model=128,
     n_heads=4,
-    n_layers=2,
-    dropout=0.3,
+    n_layers=4,
+    dropout=0.2,
 ).to(device)
 
-# ------------------------------------------------------------
-# 7) Loss, optimizer, scheduler (warmup + cosine), early stopping
-# ------------------------------------------------------------
-# class imbalance handling: pos_weight for "Dead" class
-n_pos = (y_train == 1).sum()
-n_neg = (y_train == 0).sum()
-pos_weight = torch.tensor(n_neg / max(n_pos, 1), dtype=torch.float32, device=device)
-print(f"\npos_weight for BCEWithLogitsLoss: {pos_weight.item():.3f}")
-
-criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+# Loss & optimizer for SAINT
+pos_weight_torch = torch.tensor(scale_pos_weight, dtype=torch.float32, device=device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_torch)
+optimizer = torch.optim.AdamW(saint_model.parameters(), lr=1e-3, weight_decay=1e-4)
 
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """
-    Cosine annealing with linear warmup.
-    step() should be called once per optimizer step.
-    """
     def __init__(self, optimizer, warmup_steps, max_steps, last_epoch=-1):
         self.warmup_steps = max(1, warmup_steps)
         self.max_steps = max_steps
@@ -241,23 +292,20 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         step = self.last_epoch + 1
 
         if step <= self.warmup_steps:
-            # linear warmup
             return [base_lr * step / self.warmup_steps for base_lr in self.base_lrs]
 
         if step >= self.max_steps:
-            # after max_steps, keep lr at a small value
             return [base_lr * 0.1 for base_lr in self.base_lrs]
 
-        # cosine decay
         progress = (step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
         return [
             base_lr * 0.5 * (1 + math.cos(math.pi * progress))
             for base_lr in self.base_lrs
         ]
 
-EPOCHS = 80
+EPOCHS = 60
 total_steps = EPOCHS * len(train_loader)
-warmup_steps = int(0.1 * total_steps)  # 10% warmup
+warmup_steps = int(0.1 * total_steps)
 
 scheduler = CosineWarmupScheduler(
     optimizer,
@@ -271,9 +319,6 @@ def get_auc_safe(y_true, y_proba):
     except ValueError:
         return np.nan
 
-# ------------------------------------------------------------
-# 8) Train / Eval functions
-# ------------------------------------------------------------
 def train_epoch(model, loader, optimizer, scheduler, device):
     model.train()
     total_loss = 0.0
@@ -331,18 +376,16 @@ def eval_epoch(model, loader, device):
     all_labels = np.concatenate(all_labels)
     return avg_loss, all_probs, all_labels
 
-# ------------------------------------------------------------
-# 9) Training loop with early stopping on Val AUC
-# ------------------------------------------------------------
+# Train SAINT-B with early stopping on Val AUC
 best_val_auc = -np.inf
 best_state = None
-patience = 15
+patience = 12
 no_improve = 0
 
-print("\n🚀 Training improved SAINT-style Transformer (with warmup + early stopping)...")
+print("\n🚀 Training SAINT-B Transformer (bigger, with warmup + early stopping)...")
 for epoch in range(1, EPOCHS + 1):
-    train_loss, train_proba, train_labels = train_epoch(model, train_loader, optimizer, scheduler, device)
-    val_loss, val_proba, val_labels = eval_epoch(model, val_loader, device)
+    train_loss, train_proba, train_labels = train_epoch(saint_model, train_loader, optimizer, scheduler, device)
+    val_loss, val_proba, val_labels = eval_epoch(saint_model, val_loader, device)
 
     train_auc = get_auc_safe(train_labels, train_proba)
     val_auc = get_auc_safe(val_labels, val_proba)
@@ -356,7 +399,7 @@ for epoch in range(1, EPOCHS + 1):
 
     if val_auc > best_val_auc:
         best_val_auc = val_auc
-        best_state = model.state_dict()
+        best_state = saint_model.state_dict()
         no_improve = 0
     else:
         no_improve += 1
@@ -364,49 +407,186 @@ for epoch in range(1, EPOCHS + 1):
             print(f"⏹ Early stopping at epoch {epoch} (no improvement in Val AUC for {patience} epochs).")
             break
 
-print(f"\nBest Val AUC: {best_val_auc:.4f}")
+print(f"\nBest SAINT-B Val AUC: {best_val_auc:.4f}")
 if best_state is not None:
-    model.load_state_dict(best_state)
+    saint_model.load_state_dict(best_state)
+
+# Helper: get probabilities from SAINT
+def get_saint_probs(loader, device):
+    saint_model.eval()
+    all_probs = []
+    with torch.no_grad():
+        for cat_batch, num_batch, y_batch in loader:
+            if cat_batch is not None:
+                cat_batch = cat_batch.to(device)
+            if num_batch is not None:
+                num_batch = num_batch.to(device)
+            logits = saint_model(cat_batch, num_batch)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.cpu().numpy())
+    return np.concatenate(all_probs)
 
 # ------------------------------------------------------------
-# 10) Final evaluation on Train / Val / Test
+# 7) Base model probabilities on VAL and TEST
 # ------------------------------------------------------------
-def eval_split(loader, y_true_full, split_name):
-    loss, proba, _ = eval_epoch(model, loader, device)
-    proba = proba.reshape(-1)
-    y_true = y_true_full
-    y_pred = (proba >= 0.5).astype(int)
+# Tree models
+val_proba_xgb = xgb_model.predict_proba(X_val_arr)[:, 1]
+test_proba_xgb = xgb_model.predict_proba(X_test_arr)[:, 1]
 
+val_proba_lgbm = lgbm_model.predict_proba(X_val_arr)[:, 1]
+test_proba_lgbm = lgbm_model.predict_proba(X_test_arr)[:, 1]
+
+val_proba_cat = cat_model.predict_proba(X_val_arr)[:, 1]
+test_proba_cat = cat_model.predict_proba(X_test_arr)[:, 1]
+
+# SAINT-B
+val_proba_saint = get_saint_probs(val_loader, device)
+test_proba_saint = get_saint_probs(test_loader, device)
+
+# ------------------------------------------------------------
+# 8) Meta-learner: XGBoost on validation probabilities
+# ------------------------------------------------------------
+X_meta_val = np.vstack([
+    val_proba_xgb,
+    val_proba_lgbm,
+    val_proba_cat,
+    val_proba_saint,
+]).T  # shape (N_val, 4)
+
+X_meta_test = np.vstack([
+    test_proba_xgb,
+    test_proba_lgbm,
+    test_proba_cat,
+    test_proba_saint,
+]).T  # shape (N_test, 4)
+
+meta_model = XGBClassifier(
+    n_estimators=300,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    random_state=42,
+)
+
+meta_model.fit(X_meta_val, y_val)
+
+meta_proba_val = meta_model.predict_proba(X_meta_val)[:, 1]
+meta_proba_test = meta_model.predict_proba(X_meta_test)[:, 1]
+
+# ------------------------------------------------------------
+# 9) Helper to evaluate a model
+# ------------------------------------------------------------
+def evaluate_probs(y_true, proba, name="Model", thr=0.5, verbose=True):
+    y_pred = (proba >= thr).astype(int)
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
-    auc = get_auc_safe(y_true, proba)
+    auc = roc_auc_score(y_true, proba)
 
-    print("\n==============================")
-    print(f" SAINT-style Transformer on {split_name}")
+    if verbose:
+        print("\n==============================")
+        print(f" {name} (thr={thr:.2f})")
+        print("==============================")
+        print(f"Accuracy     : {acc:.4f}")
+        print(f"Precision    : {prec:.4f}")
+        print(f"Recall       : {rec:.4f}")
+        print(f"F1-score     : {f1:.4f}")
+        print(f"AUC          : {auc:.4f}")
+        print("\nClassification report:")
+        print(classification_report(y_true, y_pred, target_names=["Alive", "Dead"]))
+
+    return acc, prec, rec, f1, auc
+
+# ------------------------------------------------------------
+# 10) Evaluate base models & meta on TEST (thr=0.5)
+# ------------------------------------------------------------
+print("\n########## BASE MODELS ON TEST (thr=0.5) ##########")
+evaluate_probs(y_test, test_proba_xgb, "XGBoost (base)")
+evaluate_probs(y_test, test_proba_lgbm, "LightGBM (base)")
+evaluate_probs(y_test, test_proba_cat, "CatBoost (base)")
+evaluate_probs(y_test, test_proba_saint, "SAINT-B (base)")
+
+print("\n########## META-ENSEMBLE ON TEST (thr=0.5) ##########")
+evaluate_probs(y_test, meta_proba_test, "STACKED ENSEMBLE (XGB meta)")
+
+# ------------------------------------------------------------
+# 11) Threshold scanning for meta on Validation
+# ------------------------------------------------------------
+def scan_thresholds(y_true, y_proba, model_name="Model", min_recall=None):
+    thresholds = np.linspace(0.05, 0.95, 19)
+    rows = []
+
+    for thr in thresholds:
+        y_pred = (y_proba >= thr).astype(int)
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        rows.append({
+            "threshold": thr,
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+        })
+
+    df_thr = pd.DataFrame(rows)
+
+    print(f"\n==============================")
+    print(f" Threshold scan for {model_name}")
     print("==============================")
-    print(f"Accuracy     : {acc:.4f}")
-    print(f"Precision    : {prec:.4f}")
-    print(f"Recall       : {rec:.4f}")
-    print(f"F1-score     : {f1:.4f}")
-    print(f"AUC          : {auc:.4f}")
-    print("\nClassification report:")
-    print(classification_report(y_true, y_pred, target_names=["Alive", "Dead"]))
+    if min_recall is not None:
+        df_filtered = df_thr[df_thr["recall"] >= min_recall].sort_values("f1", ascending=False)
+        if df_filtered.empty:
+            print(f"No threshold found with recall >= {min_recall}")
+        else:
+            best_row = df_filtered.iloc[0]
+            print(f"Best threshold with recall >= {min_recall}:")
+            print(best_row)
+    else:
+        df_sorted = df_thr.sort_values("f1", ascending=False)
+        best_row = df_sorted.iloc[0]
+        print("Best threshold by F1:")
+        print(best_row)
 
-    return y_true, y_pred, proba
+    return df_thr
 
-y_train_true, y_train_pred, train_proba_final = eval_split(train_loader, y_train, "TRAIN")
-y_val_true, y_val_pred, val_proba_final = eval_split(val_loader, y_val, "VALIDATION")
-y_test_true, y_test_pred, test_proba_final = eval_split(test_loader, y_test, "TEST")
+# you can change min_recall to e.g. 0.8
+df_thr_meta_val = scan_thresholds(y_val, meta_proba_val,
+                                  model_name="STACKED ENSEMBLE (Validation)",
+                                  min_recall=0.7)
+
+# choose best threshold (recall>=0.7 if possible, otherwise best F1)
+df_thr_highrec = df_thr_meta_val[df_thr_meta_val["recall"] >= 0.7]
+if not df_thr_highrec.empty:
+    best_thr_row = df_thr_highrec.sort_values("f1", ascending=False).iloc[0]
+else:
+    best_thr_row = df_thr_meta_val.sort_values("f1", ascending=False).iloc[0]
+
+best_thr = float(best_thr_row["threshold"])
+print(f"\n🔥 Selected best threshold from VALIDATION for META: {best_thr:.3f}")
+print(best_thr_row)
 
 # ------------------------------------------------------------
-# 11) Confusion matrix & ROC for TEST
+# 12) Final META performance on TEST with tuned threshold
 # ------------------------------------------------------------
-cm = confusion_matrix(y_test_true, y_test_pred)
+acc_t, prec_t, rec_t, f1_t, auc_t = evaluate_probs(
+    y_test, meta_proba_test,
+    name=f"STACKED ENSEMBLE (TEST, tuned thr={best_thr:.3f})",
+    thr=best_thr,
+    verbose=True
+)
+
+# Confusion matrix for tuned meta
+y_test_pred_tuned = (meta_proba_test >= best_thr).astype(int)
+cm = confusion_matrix(y_test, y_test_pred_tuned)
 tn, fp, fn, tp = cm.ravel()
 spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-print(f"\nSpecificity (Test): {spec:.4f}")
+print(f"\nSpecificity (Test, tuned threshold): {spec:.4f}")
 
 plt.figure(figsize=(4, 4))
 sns.heatmap(
@@ -414,18 +594,18 @@ sns.heatmap(
     xticklabels=["Pred Alive", "Pred Dead"],
     yticklabels=["True Alive", "True Dead"]
 )
-plt.title("Confusion Matrix - SAINT (Test)")
+plt.title(f"Confusion Matrix - STACKED ENSEMBLE (Test, thr={best_thr:.2f})")
 plt.tight_layout()
 plt.show()
 
-fpr, tpr, _ = roc_curve(y_test_true, test_proba_final)
-test_auc = roc_auc_score(y_test_true, test_proba_final)
+# ROC curve for meta on TEST
+fpr, tpr, _ = roc_curve(y_test, meta_proba_test)
 plt.figure(figsize=(6, 5))
-plt.plot(fpr, tpr, label=f"SAINT Test (AUC = {test_auc:.4f})")
+plt.plot(fpr, tpr, label=f"STACKED ENSEMBLE Test (AUC = {auc_t:.4f})")
 plt.plot([0, 1], [0, 1], "--", color="gray")
 plt.xlabel("False Positive Rate")
 plt.ylabel("True Positive Rate")
-plt.title("ROC Curve - SAINT (Test)")
+plt.title("ROC Curve - STACKED ENSEMBLE (Test)")
 plt.legend()
 plt.grid(True, linestyle="--", alpha=0.7)
 plt.tight_layout()
